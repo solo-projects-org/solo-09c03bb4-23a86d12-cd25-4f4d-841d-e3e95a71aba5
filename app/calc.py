@@ -6,8 +6,10 @@
 - 相邻月没有可比报价对（或中间缺月）→ 该月环比为空，且自该月起指数断链留空。
 - 指数 = 上月指数 × 本月环比系数。
 
-只重算受影响的环比：某月被补报或更正后，该月与下一月的环比需要重算，
-其余月份的环比沿用上一次结果；指数则从基月向后重新串联。
+只重算受影响的环比：某月被补报或更正后，分别检查该月（对上前月）与
+下一月（对本月）这两段环比——只有当可比报价对增减、或其中任一价格变化时，
+才重算该段；其余月份沿用上一次结果。指数则从基月向后重新串联（断链/接续
+规则不变）。
 """
 
 from __future__ import annotations
@@ -41,6 +43,23 @@ def pair_factor(
     return len(ratios), round(sum(ratios) / len(ratios), FACTOR_DECIMALS)
 
 
+def pairing_changed(
+    old: dict[tuple[str, str], float],
+    new: dict[tuple[str, str], float],
+    other: dict[tuple[str, str], float],
+) -> bool:
+    """与 other 月的可比报价对是否变化（对数增减或配对价格变动）。
+
+    old/new 是本次重报月份改动前后的报价，other 是相邻月报价。把 old/new
+    换成「相邻月改动前后」、other 换成重报月，同样成立，故两侧边界共用。
+    """
+    old_pairs = old.keys() & other.keys()
+    new_pairs = new.keys() & other.keys()
+    if old_pairs != new_pairs:
+        return True
+    return any(old[key] != new[key] for key in new_pairs)
+
+
 def _latest_upload_ids(conn: sqlite3.Connection) -> dict[str, int]:
     rows = conn.execute(
         "SELECT month, MAX(id) AS upload_id FROM uploads GROUP BY month"
@@ -51,12 +70,13 @@ def _latest_upload_ids(conn: sqlite3.Connection) -> dict[str, int]:
 def recompute(
     conn: sqlite3.Connection,
     base_month: str,
-    changed_month: str | None = None,
+    factor_months: set[str] | None = None,
     latest_month: str | None = None,
 ) -> list[str]:
     """重算并写入 index_months，返回页面展示的月份序列。
 
-    调用方负责事务。changed_month 为空表示全量重算。
+    调用方负责事务。factor_months 为需要重算环比系数的月份集合；
+    传 None 表示全量重算（首次建库/新建基月）。
     """
     latest = latest_month or db.max_uploaded_month(conn)
     if latest is None or latest < base_month:
@@ -70,12 +90,13 @@ def recompute(
     }
     upload_ids = _latest_upload_ids(conn)
 
-    # 需要重算环比系数的月份
-    if changed_month is None:
-        factor_months = {m for m in months if m > base_month}
+    # 需要重算环比系数的月份；None = 全量
+    if factor_months is None:
+        recompute_set: set[str] | None = None
     else:
-        candidates = {changed_month, db.next_month(changed_month)}
-        factor_months = {m for m in candidates if m in month_set and m > base_month}
+        recompute_set = {
+            m for m in factor_months if m in month_set and m > base_month
+        }
 
     factors: dict[str, tuple[int, float | None]] = {}
     price_cache: dict[str, dict[tuple[str, str], float]] = {}
@@ -89,7 +110,7 @@ def recompute(
         if m == base_month:
             factors[m] = (0, None)
             continue
-        if m in factor_months or m not in existing:
+        if recompute_set is None or m in recompute_set or m not in existing:
             factors[m] = pair_factor(prices(m), prices(db.previous_month(m)))
         else:
             prev = existing[m]

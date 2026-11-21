@@ -89,7 +89,9 @@ def upload():
 
     verb = "替换" if result["replaced"] else "载入"
     flash(
-        f"已{verb} {result['month']} 的 {result['rows']} 条报价"
+        f"批次 #{result['upload_id']}：已{verb} {result['month']} 的 "
+        f"{result['rows']} 条报价 — 新增 {result['added']}、"
+        f"改价 {result['changed']}、撤下 {result['removed']}"
         + ("，该月为基月" if result["month"] == result["base_month"] else ""),
         "success",
     )

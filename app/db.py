@@ -2,11 +2,12 @@
 
 设计要点：
 - 报价明细（prices）与指数结果（index_months）分表存放。
-- 每个报价批次（upload）带自增 id；同一月份只保留最新批次的报价，
-  且指数结果表保存了算该结果时所用的报价版本（source_upload_id），
-  因此「查指数」只读结果表，不碰报价明细。
-- 任何一次整月替换都在单个事务内完成：先写入新报价、再重算受影响的
-  指数、最后才提交。任何一步失败回滚，旧报价与旧结果都保留。
+- 每个报价批次（upload）带自增 id；重报按摊位/品种增量写入，只有新增、
+  改价、撤下的行会改动 prices，明细同时记入 price_changes 备查。
+- 指数结果表保存了算该结果时所用的报价版本（source_upload_id），因此
+  「查指数」只读结果表，不碰报价明细。
+- 一次重报的「登记批次 → 增量写报价 → 重算受影响的环比 → 写指数」在单个
+  事务内完成。任何一步失败回滚，此前生效的报价、批次和指数都保留。
 """
 
 from __future__ import annotations
@@ -21,17 +22,23 @@ PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
 
 CREATE TABLE IF NOT EXISTS uploads (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    month         TEXT    NOT NULL,          -- 'YYYY-MM'
-    filename      TEXT    NOT NULL,
-    row_count     INTEGER NOT NULL,
-    uploaded_at   TEXT    NOT NULL,          -- UTC ISO8601
-    is_base_month INTEGER NOT NULL DEFAULT 0
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    month           TEXT    NOT NULL,        -- 'YYYY-MM'
+    filename        TEXT    NOT NULL,
+    row_count       INTEGER NOT NULL,        -- 本次文件中的有效行数（=重报后的整月行数）
+    uploaded_at     TEXT    NOT NULL,        -- UTC ISO8601
+    is_base_month   INTEGER NOT NULL DEFAULT 0,
+    added_count     INTEGER NOT NULL DEFAULT 0,  -- 相对上一版新增
+    changed_count   INTEGER NOT NULL DEFAULT 0,  -- 相对上一版改价
+    removed_count   INTEGER NOT NULL DEFAULT 0,  -- 相对上一版撤下
+    unchanged_count INTEGER NOT NULL DEFAULT 0   -- 与上一版完全相同
 );
 
 CREATE INDEX IF NOT EXISTS idx_uploads_month ON uploads(month, id);
 
 -- 当前生效的报价：同月同摊同品种唯一。
+-- upload_id 是最后一次物理写入该价格行的批次；整月报价的生效批次以
+-- uploads 中该月最新批次为准（指数 source_upload_id 同步指向它）。
 CREATE TABLE IF NOT EXISTS prices (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     upload_id  INTEGER NOT NULL REFERENCES uploads(id) ON DELETE CASCADE,
@@ -61,7 +68,35 @@ CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+-- 每次重报实际改动过的报价行（新增 / 改价 / 撤下）。
+-- 内容未变的行不写这里，但仍会随整月归入新批次。
+CREATE TABLE IF NOT EXISTS price_changes (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    upload_id   INTEGER NOT NULL REFERENCES uploads(id) ON DELETE CASCADE,
+    month       TEXT    NOT NULL,
+    stall       TEXT    NOT NULL,
+    item        TEXT    NOT NULL,
+    change_type TEXT    NOT NULL CHECK (change_type IN ('add', 'change', 'remove')),
+    old_price   REAL,
+    new_price   REAL
+);
+
+CREATE INDEX IF NOT EXISTS idx_price_changes_upload
+    ON price_changes(upload_id, id);
 """
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """给旧库补上重报统计列（CREATE TABLE IF NOT EXISTS 不会改旧表）。"""
+    columns = {
+        r["name"] for r in conn.execute("PRAGMA table_info(uploads)").fetchall()
+    }
+    for name in ("added_count", "changed_count", "removed_count", "unchanged_count"):
+        if name not in columns:
+            conn.execute(
+                f"ALTER TABLE uploads ADD COLUMN {name} INTEGER NOT NULL DEFAULT 0"
+            )
 
 
 def connect(database: str | Path) -> sqlite3.Connection:
@@ -78,6 +113,8 @@ def init_db(database: str | Path) -> None:
     conn = connect(database)
     try:
         conn.executescript(SCHEMA)
+        with transaction(conn):
+            _migrate(conn)
     finally:
         conn.close()
 
@@ -175,3 +212,27 @@ def recent_uploads(conn: sqlite3.Connection, limit: int = 20) -> list[sqlite3.Ro
     return conn.execute(
         "SELECT * FROM uploads ORDER BY id DESC LIMIT ?", (limit,)
     ).fetchall()
+
+
+def month_upload_count(conn: sqlite3.Connection, month: str) -> int:
+    row = conn.execute(
+        "SELECT COUNT(*) AS c FROM uploads WHERE month = ?", (month,)
+    ).fetchone()
+    return int(row["c"])
+
+
+def insert_price_changes(
+    conn: sqlite3.Connection,
+    upload_id: int,
+    month: str,
+    changes: Sequence[dict],
+) -> None:
+    conn.executemany(
+        """
+        INSERT INTO price_changes
+            (upload_id, month, stall, item, change_type, old_price, new_price)
+        VALUES (:upload_id, :month, :stall, :item, :change_type, :old_price,
+                :new_price)
+        """,
+        [{**c, "upload_id": upload_id, "month": month} for c in changes],
+    )

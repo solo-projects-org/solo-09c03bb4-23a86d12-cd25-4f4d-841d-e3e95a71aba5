@@ -1,4 +1,8 @@
-"""报价 CSV 解析与上传业务逻辑。"""
+"""报价 CSV 解析与重报业务逻辑。
+
+重报是增量写入：整份 CSV 仍然上传，但落库时按 (摊位, 品种) 与本次生效前的
+最新报价比对，只有新增、改价、撤下的行会触发报价值写入与环比重算。
+"""
 
 from __future__ import annotations
 
@@ -164,7 +168,13 @@ def base_month(conn) -> str | None:
 
 
 def process_upload(conn, raw: bytes, filename: str) -> dict:
-    """解析 + 整月替换 + 重算指数，单事务完成。"""
+    """解析 + 增量重报 + 重算指数，单事务完成。
+
+    重报时按 (摊位, 品种) 与「本次生效前」的最新报价比对，价格表只写入新增、
+    改价、撤下的行，未变行一个字段都不动。整月报价仍归入新批次：批次记录的
+    row_count 是整月有效行数，指数结果的 source_upload_id 指向该批次。
+    即使内容完全相同也会登记新批次（增/改/删均为 0）。
+    """
     parsed = parse_csv(raw)
     month = parsed.month
 
@@ -182,24 +192,117 @@ def process_upload(conn, raw: bytes, filename: str) -> dict:
         if len(db.month_range(new_base, latest)) > MAX_MONTHS:
             raise UploadError(f"基月到最新报价月的跨度不能超过 {MAX_MONTHS} 个月")
 
+        # 事务开始后读取：并发重报被 BEGIN IMMEDIATE 串行化，这里拿到的是
+        # 本次生效前最后一次已提交的报价。
+        had_upload = db.month_upload_count(conn, month) > 0
+        old_prices = db.month_prices(conn, month)
+        new_prices = {(r.stall, r.item): r.price for r in parsed.rows}
+
+        added_keys = new_prices.keys() - old_prices.keys()
+        removed_keys = old_prices.keys() - new_prices.keys()
+        changed_keys = {
+            key
+            for key in new_prices.keys() & old_prices.keys()
+            if new_prices[key] != old_prices[key]
+        }
+        unchanged_keys = new_prices.keys() - added_keys - changed_keys
+
+        # 本月环比（对前月）与下月环比（对本月）分别判断：只有可比报价对
+        # 增减、或配对中任一价格变化，才重算那一段。本月由「缺月」变为
+        # 「有报价」时，即使凑不出可比报价对，也要把 0 对/空环比落库。
+        factor_months: set[str] = set()
+        if existing_base is not None:
+            prev_prices = db.month_prices(conn, db.previous_month(month))
+            if month > new_base and (
+                not had_upload
+                or calc.pairing_changed(old_prices, new_prices, prev_prices)
+            ):
+                factor_months.add(month)
+            next_month = db.next_month(month)
+            next_prices = db.month_prices(conn, next_month)
+            if next_month > new_base and calc.pairing_changed(
+                old_prices, new_prices, next_prices
+            ):
+                factor_months.add(next_month)
+
         cur = conn.execute(
-            "INSERT INTO uploads(month, filename, row_count, uploaded_at, is_base_month) "
-            "VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO uploads"
+            "(month, filename, row_count, uploaded_at, is_base_month, "
+            " added_count, changed_count, removed_count, unchanged_count) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 month,
                 filename or "upload.csv",
                 len(parsed.rows),
                 calc.now_iso(),
                 1 if month == new_base else 0,
+                len(added_keys),
+                len(changed_keys),
+                len(removed_keys),
+                len(unchanged_keys),
             ),
         )
         upload_id = cur.lastrowid
 
-        conn.execute("DELETE FROM prices WHERE month = ?", (month,))
+        # 报价值写入严格限定为增、改、删三类行。
         conn.executemany(
             "INSERT INTO prices(upload_id, month, stall, item, price) "
             "VALUES (?, ?, ?, ?, ?)",
-            [(upload_id, month, r.stall, r.item, r.price) for r in parsed.rows],
+            [
+                (upload_id, month, stall, item, new_prices[(stall, item)])
+                for stall, item in added_keys
+            ],
+        )
+        conn.executemany(
+            "UPDATE prices SET price = ?, upload_id = ? "
+            "WHERE month = ? AND stall = ? AND item = ?",
+            [
+                (new_prices[key], upload_id, month, key[0], key[1])
+                for key in changed_keys
+            ],
+        )
+        conn.executemany(
+            "DELETE FROM prices WHERE month = ? AND stall = ? AND item = ?",
+            [(month, stall, item) for stall, item in removed_keys],
+        )
+        # 报价值与价格行的写入严格限定为增、改、删三类行：未变行一个字段都
+        # 不重写。整月报价归新批次记在批次表：本批次的 row_count 即整月有效
+        # 行数，指数结果的 source_upload_id 也指向本批次。
+
+        db.insert_price_changes(
+            conn,
+            upload_id,
+            month,
+            [
+                {
+                    "stall": stall,
+                    "item": item,
+                    "change_type": "add",
+                    "old_price": None,
+                    "new_price": new_prices[(stall, item)],
+                }
+                for stall, item in sorted(added_keys)
+            ]
+            + [
+                {
+                    "stall": stall,
+                    "item": item,
+                    "change_type": "change",
+                    "old_price": old_prices[(stall, item)],
+                    "new_price": new_prices[(stall, item)],
+                }
+                for stall, item in sorted(changed_keys)
+            ]
+            + [
+                {
+                    "stall": stall,
+                    "item": item,
+                    "change_type": "remove",
+                    "old_price": old_prices[(stall, item)],
+                    "new_price": None,
+                }
+                for stall, item in sorted(removed_keys)
+            ],
         )
 
         if existing_base is None:
@@ -208,7 +311,7 @@ def process_upload(conn, raw: bytes, filename: str) -> dict:
         calc.recompute(
             conn,
             new_base,
-            changed_month=None if existing_base is None else month,
+            factor_months=None if existing_base is None else factor_months,
             latest_month=latest,
         )
 
@@ -218,4 +321,10 @@ def process_upload(conn, raw: bytes, filename: str) -> dict:
         "upload_id": upload_id,
         "base_month": new_base,
         "replaced": existing_base is not None,
+        "added": len(added_keys),
+        "changed": len(changed_keys),
+        "removed": len(removed_keys),
+        "unchanged": len(unchanged_keys),
+        "recomputed": sorted(factor_months),
+        "full_recompute": existing_base is None,
     }

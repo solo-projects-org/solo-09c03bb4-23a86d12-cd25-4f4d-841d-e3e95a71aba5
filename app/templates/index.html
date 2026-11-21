@@ -31,7 +31,8 @@
       </form>
       <p class="hint">
         CSV 表头：<code>月份,摊位,品种,每公斤报价</code>。一次只传一个月；
-        重复上传同一月份会整体替换该月报价。基月由第一次上传确定，早于基月的报价会被拒收。
+        重复上传同一月份按摊位和品种与当前报价比对，只写入新增、改价和撤下的行，
+        整月报价归入新批次。基月由第一次上传确定，早于基月的报价会被拒收。
       </p>
     </section>
 
@@ -44,6 +45,7 @@
         <form method="post" action="{{ url_for('main.run_demo', action='break') }}"><button>换掉 2025-03（制造断链）</button></form>
         <form method="post" action="{{ url_for('main.run_demo', action='repair') }}"><button>恢复 2025-03 原报价</button></form>
         <form method="post" action="{{ url_for('main.run_demo', action='correct') }}"><button>更正 2025-02 的 A-01 报价 +20%</button></form>
+        <form method="post" action="{{ url_for('main.run_demo', action='one_sided') }}"><button>只改 2 月 C-01 菠菜 +50%（只动一侧环比）</button></form>
         <form method="post" action="{{ url_for('main.run_demo', action='reset') }}"
               onsubmit="return confirm('将删除全部报价与指数（包括手工上传的数据），确定？')">
           <button class="danger">清空全部数据</button>
@@ -95,13 +97,16 @@
     <section class="card">
       <h2>最近上传</h2>
       <table class="compact">
-        <thead><tr><th>#</th><th>月份</th><th>条数</th><th>文件</th><th>时间（UTC）</th></tr></thead>
+        <thead><tr><th>批次</th><th>月份</th><th>条数</th><th>新增</th><th>改价</th><th>撤下</th><th>文件</th><th>时间（UTC）</th></tr></thead>
         <tbody>
           {% for u in uploads %}
           <tr>
             <td>{{ u['id'] }}</td>
             <td>{{ u['month'] }}</td>
             <td class="num">{{ u['row_count'] }}</td>
+            <td class="num">{{ u['added_count'] }}</td>
+            <td class="num">{{ u['changed_count'] }}</td>
+            <td class="num">{{ u['removed_count'] }}</td>
             <td class="filename">{{ u['filename'] }}</td>
             <td class="num">{{ u['uploaded_at'] }}</td>
           </tr>
